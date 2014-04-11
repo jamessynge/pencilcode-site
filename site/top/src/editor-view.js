@@ -45,6 +45,7 @@ var state = {
   nameText: $('#filename').text(),
   previewMode: true,
   callbacks: {},
+  subscriber: null,
   depth: window.history.state && window.history.state.depth || 0,
   aborting: false,
   pane: {
@@ -67,6 +68,16 @@ ZeroClipboard.config({
 window.pencilcode.view = {
   // Listens to events
   on: function(tag, cb) { state.callbacks[tag] = cb; },
+
+  // start code execution
+  run: function(){ fireEvent('run', []); },
+
+  // publish/subscribe for global events; all global events are broadcast
+  // to the parent frames using postMessage() if we are iframed
+  subscribe: function(callback){
+    state.subscriber = callback; },
+  publish: publish,
+
   // Sets up the text-editor in the view.
   paneid: paneid,
   panepos: panepos,
@@ -88,6 +99,15 @@ window.pencilcode.view = {
   hideProtractor: hideProtractor,
   setPrimaryFocus: setPrimaryFocus,
   // setPaneRunUrl: setPaneRunUrl,
+  hideEditor: function(pane) {
+    $('#' + pane + 'title').hide();
+    $('#' + pane).hide();
+  },
+  showEditor: function(pane) {
+    $('#' + pane).show();
+    $('#' + pane + 'title').show();
+  },
+
   // Mananges panes and preview mode
   setPreviewMode: setPreviewMode,
   getPreviewMode: function() { return state.previewMode; },
@@ -106,7 +126,15 @@ window.pencilcode.view = {
   showShareDialog: showShareDialog,
   showDialog: showDialog,
   // The run button
-  showMiddleButton: showMiddleButton,
+  canShowMiddleButton: true,
+  showMiddleButton: function(which) {
+    if (window.pencilcode.view.canShowMiddleButton) {
+      $('#middle').show();
+      showMiddleButton(which);
+    } else {
+      $('#middle').hide();
+    }
+  },
   // Sets editable name.
   setNameText: function(s) {
     state.nameText = s;
@@ -126,6 +154,10 @@ window.pencilcode.view = {
   setVisibleUrl: setVisibleUrl,
   parseTemplateWrapper: parseTemplateWrapper
 };
+
+function publish(method, args){
+  if (state.subscriber) { state.subscriber(method, args); }
+}
 
 function paneid(position) {
   return $('.' + position).filter('.pane').attr('id');
@@ -542,9 +574,14 @@ function enableButton(id, enable) {
   }
 }
 
+// Centers the middle button div using javascript.
 function centerMiddle() {
   var m = $('#middle');
+  // Horizontal center taking into account the button width.
   m.css({left:($(window).width() - m.outerWidth()) / 2});
+  // Vertical center taking into the editor height and button height.
+  m.css({top:($(window).height() -
+      ($('.pane').height() + m.outerHeight()) / 2)})
 }
 
 $(window).on('resize.middlebutton', centerMiddle);
@@ -906,8 +943,8 @@ function wrapTurtle(text) {
   return (
 '<!doctype html>\n<html>\n<head>\n<script src="http://' +
 window.pencilcode.domain + '/turtlebits.js"><\057script>\n' +
-'</head>\n<body>\n<script type="text/coffeescript">\neval $.turtle()\n\n' +
-text + '\n<\057script>\n</body>\n</html>\n');
+'</head>\n<body><script type="text/coffeescript">\neval $.turtle()\n\n' +
+text + '\n<\057script></body></html>');
 }
 
 function parseTemplateWrapper(wrapperText) {
@@ -1367,7 +1404,12 @@ function updatePaneTitle(pane) {
 }
 
 function normalizeCarriageReturns(text) {
-  return text.replace(/\r\n|\r/g, "\n");
+  var result = text.replace(/\r\n|\r/g, "\n");
+  if (result.length && result.substr(result.length - 1) != '\n') {
+    // Ensure empty last line.
+    result += '\n';
+  }
+  return result;
 }
 
 // The ACE editor's default keybinding for repeated Ctrl-F is dangerous
@@ -1436,6 +1478,18 @@ function fixRepeatedCtrlFCommand(editor) {
   }])
 }
 
+function getTextRowsAndColumns(text) {
+  var rawlines = text.split('\n');
+  var columns = 0;
+  for (var j = 0; j < rawlines.length; ++j) {
+    columns = Math.max(columns, rawlines[j].length);
+  }
+  return {
+    rows: rawlines.length,
+    columns: columns
+  };
+}
+
 // Initializes an (ACE) editor into a pane, using the given text and the
 // given filename.
 // @param pane the id of a pane - alpha, bravo or charlie.
@@ -1472,50 +1526,81 @@ function setPaneEditorText(pane, text, filename, instructionHTML) {
   editor.getSession().setMode(modeForMimeType(paneState.mimeType));
   var lineArr = text.split('\n');
   var lines = lineArr.length;
-  var long = (lines * 24 * 1.4 > $('#' + pane).height());
+  var dimensions = getTextRowsAndColumns(text);
+  // A big font char is 14 pixels wide and 29 pixels high.
+  var big = { width: 14, height: 29 };
+  // We're "long" if we bump out of the pane rectangle.
+  var long = ((dimensions.rows + 2) * big.height > $('#' + pane).height() ||
+              (dimensions.columns + 5) * big.width > $('#' + pane).width());
   if (long) {
-    $('.editor').css({fontWeight: 500, lineHeight: '129%'});
+    // Use a small font for long documents.
+    $('#' + pane + ' .editor').css({fontWeight: 500, lineHeight: '119%'});
     editor.setFontSize(16);
   } else {
-    $('.editor').css({fontWeight: 600, lineHeight: '121%'});
+    // Use a giant font for short documents.
+    $('#' + pane + ' .editor').css({fontWeight: 600, lineHeight: '121%'});
     editor.setFontSize(24);
   }
   editor.setValue(text);
   var um = editor.getSession().getUndoManager();
   um.reset();
+  publish('update', [text]);
   editor.getSession().setUndoManager(um);
   editor.getSession().on('change', function() {
     ensureEmptyLastLine(editor);
+    var session = editor.getSession();
+    // Flip editor to small font size when it doesn't fit any more.
     if (editor.getFontSize() > 16) {
-      if (editor.getSession().getLength() *
-          editor.getFontSize() * 1.4 > $('#' + pane).height()) {
+      var long = (session.getLength() * big.height > $('#' + pane).height());
+      if (!long) {
+        // Scan for wrapped lines.
+        for (var j = 0; j < session.getLength(); ++j) {
+          if (session.getRowLength(j) > 1) {
+            long = true;
+            break;
+          }
+        }
+      }
+      if (long) {
         editor.setFontSize(16);
-        $('.editor').css({fontWeight: 500, lineHeight: '119%'});
+        $('#' + pane + ' .editor').css({fontWeight: 500, lineHeight: '119%'});
       }
     }
     if (!paneState.dirtied) {
       fireEvent('dirty', [pane]);
     }
+    // Publish the update event for hosting frame.
+    publish('update', [session.getValue()]);
     // Any editing that changes the line count ends the debugging session.
-    if (paneState.cleanLineCount != editor.getSession().getLength()) {
+    if (paneState.cleanLineCount != session.getLength()) {
       clearPaneEditorMarks(pane);
       fireEvent('changelines', [pane]);
     }
   });
-
-  setTimeout(function() {
-    var foldMarker = '# fold';
+  // Fold any blocks with a line that ends with "# fold" or "// fold"
+  function autoFold() {
+    editor.getSession().off('tokenizerUpdate', autoFold);
+    var foldMarker = /(?:#|\/\/)\s*fold$/;
     for (var i = 0, line; (line = lineArr[i]) !== undefined; i++) {
-      if (line.lastIndexOf(foldMarker) + foldMarker.length == line.length) {
+      var match = foldMarker.exec(line);
+      if (match) {
         var data = editor.getSession().getParentFoldRangeData(i + 1);
-        editor.getSession().foldAll(data.range.start.row, data.range.end.row);
+        if (data && data.range && data.range.start && data.range.end) {
+          editor.getSession().foldAll(data.range.start.row, data.range.end.row);
+        } else if (match.index == 0) {
+          // If the # fold is not in a block and is at the 0th column,
+          // then use it as an indicator to fold all the blocks in the file.
+          editor.getSession().foldAll(0, lineArr.length);
+          return;
+        }
       }
     }
-  }, 200);
+  }
+  editor.getSession().on('tokenizerUpdate', autoFold);
   if (long) {
     editor.gotoLine(0);
   } else {
-    editor.gotoLine(lines, editor.getSession().getLine(lines - 1).length);
+    editor.gotoLine(editor.getSession().getLength() - 1, 0);
   }
   setPrimaryFocus();
   editor.on('focus', function() {
